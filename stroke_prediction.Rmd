@@ -1,0 +1,1442 @@
+---
+title: 'An Ensemble Model to Predict the Likelihood of Stroke: Development and Evaluation'
+author: "Forsythe, Sara"
+date: "Fall 2025"
+output:
+  html_document:
+    toc: true
+    toc_depth: '3'
+    df_print: paged
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(comment = "")
+```
+
+## Load Libraries
+The libraries used for this project are `reticulate`, `tidyverse`, `psych`, `randomForest`, `caret`, `glmnet`, `xgboost` and `pROC`. 
+Data is downloaded from Kaggle and saved in a dataframe. 
+```{r load-libraries, include=FALSE, warning=FALSE, message=FALSE}
+library(reticulate)
+library(tidyverse) 
+library(psych)
+library(randomForest)
+library(caret)
+library(glmnet)
+library(xgboost)
+library(pROC)
+```
+
+```{python python, include=FALSE}
+import kagglehub
+
+# Download latest version
+path = kagglehub.dataset_download("fedesoriano/stroke-prediction-dataset")
+
+print("Path to dataset files:", path)
+
+csv_file = path + "/healthcare-dataset-stroke-data.csv"
+```
+
+```{r load-data, include=FALSE}
+df <- read.csv(py$csv_file,  stringsAsFactors = TRUE, 
+               na.strings = c("NA", "N/A"))
+```
+
+## Background
+Stroke is the world’s second leading cause of death and a major driver of long-term disability. It is a neurological disorder caused by the blockage of blood vessels. Stroke occurrence increases with age. Strokes are more common in younger women than younger men and in women have been associated with pregnancy, contraceptive use and hormonal therapy. In men strokes have been associated with smoking, alcohol consumption, myocardial infarction and arterial disorders. Strokes have also been associated with air pollution, hypertension, atrial fibrillation and diabetes mellitus (Kuriakose & Xiao, 2020). 
+
+Given that stroke is a leading cause of death, the ability to predict a stroke before it occurs could provide patients and clinicians valuable time to take preventive action. This dataset contains easily collected patient information and will be used to develop predictive models to identify individuals at risk of experiencing a stroke.
+
+## Data Exploration
+
+```{r output-function, include=FALSE}
+# function to print output cleanly in RMarkdown. This will combine text with
+# R functions that manipulate data so it all prints in one block
+one_block <- function(expr) {
+  out <- capture.output(
+    eval(substitute(expr), envir = parent.frame())
+  )
+  cat(paste(out, collapse = "\n"))
+}
+
+```
+
+```{r structure, echo=FALSE}
+one_block({
+  cat("The initial data set structure:\n")
+  str(df)
+})
+```
+```{r summary, echo=FALSE}
+one_block({ cat("The initial data set summary:\n")
+    print(summary(df))})
+```
+There are `r nrow(df)` rows and `r ncol(df)` columns. Gender has 1 patient in the other category. Having only 1 patient in a category will not work for modeling because it will only appear in the training or testing set. In the training set it can cause over fitting and in the testing set it can break the model if one-hot encoding was used. Replicating it and putting in both the training and testing set would add noise.  I will convert other into NA and then impute using mode since it will be the only missing value. BMI has some abnormal values. `r min(df$bmi, na.rm = TRUE)` is very low and `r max(df$bmi, na.rm = TRUE)` is very high. The lowest reported BMI ever recorded was 6.7 (Suszko et al. 2022) and the highest BMI ever recorded was 204 (Terkawi et al. 2014). I will keep these values.  
+
+```{r other-gender, include=FALSE}
+# convert other to NA
+df$gender[df$gender == "Other"] <- NA
+# Impute NA using mode since only 1 missing value
+mode_gender <- names(which.max(table(df$gender)))
+df$gender[is.na(df$gender)] <- mode_gender
+df$gender <- factor(df$gender)
+summary(df$gender)
+```
+
+```{r sort-all-features-by-class-type, echo=FALSE}
+feature_classes <- sapply(df, class)
+
+features_by_class <- split(names(feature_classes), feature_classes)
+one_block({cat("The features sorted by class:\n")
+          print(features_by_class)})
+```
+
+Hypertension and heart_disease are binary variables and not numeric. I will convert them to factors for my data exploration but convert them back to numeric for modeling since that will work better for logistic regression and xgboost. ID is a unique identifier and will be removed. It does not provide any predictive information. It can cause data leakage because the model might memorize the number rather than learning actual patterns. The outcome variable stroke needs to be converted to a factor. 
+
+```{r outcome-factor, echo=FALSE}
+# convert binary outcome variable to factor
+df$stroke <- as.factor(df$stroke)
+one_block({cat("Stroke:\n")
+    print(table(df$stroke))})
+```
+The outcome variable stroke: 1 if the patient had a stroke or 0 if not, is very imbalanced. Only `r round(mean(df$stroke == 1) * 100, 1)`% of the patients had a stroke. This will need to be accounted for when modeling using class weights or SMOTE. 
+
+```{r factor, include=FALSE}
+# hypertension and heart_disease to factors for EDA
+df <- df %>%
+    mutate(hypertension = as.factor(hypertension),
+           heart_disease = as.factor(heart_disease))
+```
+
+```{r remove-id, include=FALSE}
+df <- df %>%
+    select(-id)
+```
+
+```{r check-for-na, echo=FALSE}
+na_cols <- colSums(is.na(df))
+one_block({cat("Count of NA values in each column:\n")
+    print(na_cols)})
+```
+The following columns have NA values: `r  names(which(na_cols > 0))`.
+
+### Impute BMI 
+```{r function-comparing-imputation-methods, include=FALSE}
+# function that compares median to linear model to random forest 
+# for imputing missing values, uses MAE and RMSE as comparison
+
+compare_imputations <- function(data, target, predictors, 
+                                train_frac = 0.8, seed = 123){
+    stopifnot(is.character(target), length(target) == 1)
+    stopifnot(all(predictors %in% names(data)))
+    stopifnot(target %in% names(data))
+    
+    # keep only complete cases
+    vars <- c(target, predictors)
+    complete_data <- data[complete.cases(data[, vars]), , drop = FALSE]
+    
+    # split
+    set.seed(seed)
+    train_idx <- sample(1:nrow(complete_data),
+                        size = train_frac * nrow(complete_data))
+    train_data <- complete_data[train_idx, ]
+    test_data  <- complete_data[-train_idx, ]
+    
+    # must be numeric target
+    if(!is.numeric(train_data[[target]])){
+        stop(paste0("Target ", target, " must be numeric for this function."))
+    }
+    
+    # formula
+    form <- as.formula(paste(target, "~", paste(predictors, collapse = "+")))
+    
+    # Linear model
+    lm_model <- lm(form, data = train_data)
+    pred_lm  <- predict(lm_model, newdata = test_data)
+    
+    # Random Forest
+    rf_model <- randomForest(
+        formula = form,
+        data    = train_data,
+        ntree   = 300,
+        mtry    = floor(sqrt(length(predictors)))
+    )
+    pred_rf <- predict(rf_model, newdata = test_data)
+    
+    # Median 
+    med_val <- median(train_data[[target]], na.rm = TRUE)
+    pred_median <- rep(med_val, nrow(test_data))
+    
+    # metrics
+    mae  <- function(a, p) mean(abs(a - p))
+    rmse <- function(a, p) sqrt(mean((a - p)^2))
+    
+    result <- data.frame(
+        method = c("Linear Model", "Random Forest", "Median"),
+        MAE    = c(
+            mae(test_data[[target]], pred_lm),
+            mae(test_data[[target]], pred_rf),
+            mae(test_data[[target]], pred_median)
+        ),
+        RMSE   = c(
+            rmse(test_data[[target]], pred_lm),
+            rmse(test_data[[target]], pred_rf),
+            rmse(test_data[[target]], pred_median)
+        )
+    )
+    
+    return(result)
+}
+
+```
+
+```{r lm-vs-median-bmi, echo=FALSE}
+compare_df <- compare_imputations(data = df, target = "bmi", 
+                    predictors = c("gender", "age", "hypertension", 
+                                   "heart_disease", "ever_married", "work_type",
+                                   "Residence_type", "avg_glucose_level", 
+                                   "smoking_status"))
+compare_df
+```
+Comparing three imputation strategies to impute BMI, median, linear regression and random forest, linear regression performed the best. It has the lowest MAE of `r round(compare_df$MAE[1], 3)` and lowest RMSE of `r round(compare_df$RMSE[1], 3)`. This suggests that the relationship between predictors and BMI in this dataset is approximately linear and I will use the linear model to impute BMI.
+
+```{r impute-bmi, echo=FALSE}
+# identify rows to impute
+idx_bmi <- which(is.na(df$bmi))
+
+# train on complete rows
+train_bmi <- df[complete.cases(df$bmi), ]
+
+# use linear model to predict bmi
+lm_bmi <- lm(bmi ~ gender + age + hypertension + heart_disease + ever_married
+             + work_type + Residence_type + avg_glucose_level + smoking_status,
+             data = train_bmi)
+
+# predict
+pred_bmi <- predict(lm_bmi, newdata = df[idx_bmi, ])
+
+# impute bmi
+df$bmi[idx_bmi] <- pred_bmi
+
+one_block({cat("Summary of BMI after imputation using linear regression:\n") 
+          print(summary(df$bmi))})
+```
+### Visualize Variables
+```{r barchart-factor-variables, echo=FALSE, fig.width=18, fig.height=16}
+# group by class type
+feature_classes <- sapply(df, class)
+
+features_by_class <- split(names(feature_classes), feature_classes)
+
+# vector in the original order for the facets to appear
+cat_order <- features_by_class$factor 
+
+# pivot long
+df_long <- df %>%
+    pivot_longer(all_of(features_by_class$factor),
+                 names_to = "variable",
+                 values_to = "value") %>%
+    mutate(variable = factor(variable, levels = cat_order))
+
+ggplot(df_long, aes(x = value)) +
+    geom_bar(fill = "steelblue") +
+    facet_wrap(~ variable, scales = "free_x", ncol = 4) +
+    labs(x = "Category", y = "Count", 
+         title = "Bar Charts of Categorical Variables") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Heart_disease and hypertension also have large class imbalance. Never_worked within work_type is very small compared to the other classes. There are `r length(which(df$work_type == "Never_worked"))` patients who have never worked. Private work type is the most common. There are more females than males in the data set. There are more married people than not married. Rural and urban living are pretty even. The majority of people have never smoked but there is a large amount of people with unknown smoking status. 
+
+```{r histograms-numeric-variables, echo=FALSE, fig.width=16, fig.height=14}
+
+# pivot long
+df_long_2 <- df %>%
+    pivot_longer(all_of(features_by_class$numeric), names_to = "variable",
+                 values_to = "value")
+
+ggplot(df_long_2, aes(x = value)) +
+    geom_histogram(bins = 15, fill = "pink", color = "black") +
+    facet_wrap(~ variable, scales = "free", ncol = 2) +
+    labs(x = "Category", y = "Count", title = "Histograms of Numeric Variables") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+           panel.spacing.y = unit(2, "lines"))
+```
+Both avg_glucose_level and bmi are right skewed and age also does not appear normally distributed. 
+
+```{r check for normality, include=FALSE}
+# can only use 5000 samples for shapiro-wilke test 
+set.seed(123)
+numeric.vars <- features_by_class$numeric
+df_5000 <- df[sample(nrow(df), 5000, replace = FALSE), ]
+
+age_norm <- shapiro.test(df_5000$age)
+glucose_norm <- shapiro.test(df_5000$avg_glucose_level)
+bmi_norm <- shapiro.test(df_5000$bmi)
+```
+
+Using the Shapiro-Wilk test the p-value of age is `r format(age_norm$p.value, scientific = TRUE, digits = 3)`. The p-value of avg_glucose_level is `r format(glucose_norm$p.value, scientific = TRUE, digits = 3)`. The p-value of bmi is `r format(bmi_norm$p.value, scientific = TRUE, digits = 3)`. The p-values are statistically significant meaning the data is not normal. It will be beneficial to log transform these variables for logistic regression.
+
+```{r add-log-cols, include=FALSE}
+# add log transformed columns for the 3 numeric variables
+# function to log transform numeric columns and add new column
+add_log_cols <- function(df, cols) {
+  for (col in cols) {
+    df[[paste0(col, "_log")]] <- log1p(df[[col]])
+  }
+  df
+}
+
+df_log <- add_log_cols(df, numeric.vars)
+```
+
+```{r visualize-logs, echo=FALSE, fig.width=16, fig.height=14}
+logs <- logs <- c("age_log", "bmi_log", "avg_glucose_level_log")
+
+# pivot long
+df_long_3 <- df_log %>%
+    pivot_longer(all_of(logs), names_to = "variable",
+                 values_to = "value")
+
+ggplot(df_long_3, aes(x = value)) +
+    geom_histogram(bins = 15, fill = "maroon", color = "black") +
+    facet_wrap(~ variable, scales = "free", ncol = 2) +
+    labs(x = "Category", y = "Count", title = 
+             "Histograms of Log Transformed Variables") +
+    theme_minimal(base_size = 14) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+           panel.spacing.y = unit(2, "lines"))
+```
+After log transformation, age became left-skewed, and average glucose level shows a secondary small peak, indicating the transformation reduced but did not eliminate non-normality. BMI, however, becomes noticeably closer to a normal distribution.
+
+Even though perfect normality is not required for logistic regression, applying log transformations and scaling the predictors to a comparable range is still beneficial. These steps help to stabilize variance, reduce the influence of extreme values, improve algorithmic convergence, and make the penalization in glmnet behave more predictably across features.
+
+Thus, scaling and transforming the numeric variables is appropriate and advantageous even if normality is not fully achieved.
+
+### Test for multicollinearity
+```{r pairs-panel, echo=FALSE}
+pairs.panels(df[, numeric.vars],
+            cex.labels = 0.6,
+            gap = 0.5
+            )
+```
+
+There is no strong pairwise correlations between the numeric variables.
+
+I will recode stroke from 0/1 to No/Yes. This is because caret models need valid R names in the predictor class levels. 
+```{r recode-stroke, include=FALSE}
+# Recode stroke from 0/1 to NO/YES, and set explicit level order
+df_log$stroke <- factor(
+  ifelse(df_log$stroke == 1, "YES", "NO"),
+  levels = c("NO", "YES")   # NO = negative class, YES = positive class
+)
+```
+
+```{r convert-back-to-numeric, echo=FALSE}
+# convert hypertension and heart disease back to numeric for modeling 
+df_log <- df_log %>%
+    mutate(hypertension = as.numeric(as.character(hypertension)),
+           heart_disease = as.numeric(as.character(heart_disease)))
+one_block({cat("Summary of final data frame to be used for modeling:\n") 
+          print(summary(df_log))})
+```
+### PCA
+```{r pca, echo=FALSE}
+# PCA can only use numeric variables, held off on one-hot encoding the
+# categorical variables to reduce dimensionality
+numeric_vars <- df_log %>%
+  select(age, avg_glucose_level, bmi, hypertension, heart_disease)
+
+pca_res <- prcomp(numeric_vars, center = TRUE, scale. = TRUE)
+sum_pca <- summary(pca_res)
+print(sum_pca)
+one_block({cat("Variable loadings:\n")
+    print(round(pca_res$rotation, 3))})
+```
+To explore overall structure in the dataset, I performed PCA using the scaled numeric features (age, average glucose level, BMI, hypertension, and heart disease). The first two principal components captured about 55% of the variance in these predictors. Principal components were identified by examining variable loadings. PC1 (`r round(sum_pca$importance[2, 1], 3) * 100`% of variance) loaded strongly and in the same direction on age, glucose, BMI, hypertension, and heart disease, representing a general cardiometabolic health dimension. PC2 (`r round(sum_pca$importance[2, 2], 3) * 100`%) was dominated by a strong positive loading on heart disease and a negative loading on BMI, representing a heart disease vs body size contrast. PC3 (`r round(sum_pca$importance[2, 3], 3) * 100`%) primarily captured variance driven by hypertension with moderate negative contributions by BMI and glucose, while PC4 (`r round(sum_pca$importance[2, 4], 3) * 100`%) captured variance primarily driven by glucose levels with moderate negative contributions by age, BMI, and heart disease. PC5 (`r round(sum_pca$importance[2, 5], 3) * 100`%) represented remaining residual variation, mainly contrasting age with BMI and heart disease. These results demonstrate that the numeric stroke features vary across several orthogonal dimensions rather than a single dominant axis, which helps explain the lack of clear class separation observed in the PCA scatterplot below.
+
+```{r visualize-pca, echo=FALSE}
+pca_df <- as.data.frame(pca_res$x) %>%
+  mutate(stroke = df$stroke)
+
+ggplot(pca_df, aes(PC1, PC2, color = stroke)) +
+  geom_point(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "PCA: Stroke vs Non-Stroke")
+```
+
+The PCA scatter plot (PC1 vs PC2) shows substantial overlap between stroke and non-stroke cases. There is no clear visual separation between classes, indicating that the primary directions of variance in the data are not driven by stroke outcomes. This aligns with the difficulty of this classification task and explains why linear models such as logistic regression struggle. The PCA results also highlight the need for nonlinear methods such as Random Forest and XGBoost, which can model complex interactions beyond what linear projections like PCA reveal.
+
+Given that this dataset is fairly small with relatively few features. I will keep all the features for modeling and not perform feature selection. 
+
+## Create models
+I will create three models. Random forest, xgboost and glm since they all can perform classification and handle numeric and categorical variables. These models are fairly interpretable which is important in healthcare. I will then combine the models into a heterogeneous ensemble using stacking. 
+
+### Split data
+I will perform a two-stage split to create three mutually exclusive sets: Training, Validation, and Test. I will reserve 20% of the full dataset as a pure hold-out test set. This test set is never touched during training, tuning, or model selection which ensures the final evaluation is unbiased and reflects real-world performance. The second split splits the data into train and validation sets. The training set (64% of total data) is used to fit models. The validation set (16% of total data) is used for hyperparameter tuning, threshold search for best F1 and stacking meta-learner training. A combination of train and validation will be used for out of fold predictions to stack the models into a heterogeneous ensemble. This ensures that all tuning decisions are validated on data that the model has not seen during training and that there is no data leakage from the test set into model selection.
+
+```{r split-data, include=FALSE}
+# keep row index
+df_log$row_id <- seq_len(nrow(df))
+
+set.seed(130)
+# 3) First split: train+val vs test
+idx1 <- createDataPartition(df_log$stroke, p = 0.8, list = FALSE)
+train_val <- df_log[idx1, ]
+test      <- df_log[-idx1, ]
+
+# 4) Second split: train vs val (from train_val only)
+idx2 <- createDataPartition(train_val$stroke, p = 0.8, list = FALSE)
+train <- train_val[idx2, ]
+val   <- train_val[-idx2, ]
+```
+
+```{r proportions, echo=FALSE}
+# ensure proper proportions were maintained between the 3 
+# datasets and the original
+one_block({cat("Orginal Data Frame:\n") 
+    print(prop.table(table(df_log$stroke)))
+    cat("Training:\n")
+    print(prop.table(table(train$stroke)))
+    cat("Validation:\n")
+    print(prop.table(table(val$stroke)))
+    cat("Testing:\n")
+    print(prop.table(table(test$stroke)))})
+```
+I will use F1 scores to tune the model thresholds since it will balance the precision and recall given the dataset’s class imbalance. I will evaluate the fit of the algorithms using AUC-ROC. The classes are very imbalanced and AUC will tell me how well the model separates the classes despite the imbalance. 
+
+```{r class-weights, include=FALSE}
+# Ensure outcome is a factor with "NO", "YES" where "YES" = positive (stroke)
+target <- "stroke"
+train[[target]] <- factor(train[[target]], levels = c("NO","YES"))
+val[[target]]   <- factor(val[[target]],   levels = c("NO","YES"))
+test[[target]]  <- factor(test[[target]],  levels = c("NO","YES"))
+
+# Build class weights from Train distribution
+tbl_tr <- table(train[[target]])
+cw_vec <- as.numeric(max(tbl_tr) / tbl_tr)
+names(cw_vec) <- names(tbl_tr)      # names: "NO", "YES"
+```
+
+
+### Functions for building models
+These functions are used when training the models.
+`add_obs_weights()` is a helper function to attach observations weights. This will be used for GLM models.
+`find_outlier_ids()` is a function that identifies outliers in numeric columns and returns row ids. This will be used for the GLM models.
+`f1_binary()` is a function that calculates F1 score.
+`pred_from_prob()` is a function that converts predicted probabilities into class predictions based on a chosen threshold.
+`f1_at_threshold()` is a helper function to determine the F1 score used in best_threshold.
+`best_threshold()` is function the finds the best threshold to maximize F1.
+`f1_summary()` is a function so F1 is used internally in model evaluation.
+`auc_binary()` is a function to calculate AUC from probabilities.
+`f1_auc_summary()` is a function that summarizes for caret F1 and AUC.
+`make_xgb_matrix()` is a function that takes a data frame and makes a matrix to pass to xgboost. It will ensure all matrices have the same columns. This will be used to create the training, validation and testing sets for XGBoost. 
+`tune_meta_glmnet_F1()`is a function to optimize F1 for the glmnet meta-learner.
+```{r attach-obs-weights, include=FALSE}
+# helper function to attach observation weights
+add_obs_weights<- function(df) {
+  df$obs_weight <- cw_vec[as.character(df[[target]])]
+  df
+}
+```
+
+```{r find-outlier-id-function, include=FALSE}
+# function that identifies outliers and returns row ids 
+find_outlier_ids <- function(dat, id_col = "row_id", z = 3) {
+    num_cols <- names(dat)[sapply(dat, is.numeric)]
+    if (!length(num_cols)) return(integer(0))
+    Z <- sapply(dat[num_cols], function(x) {
+        mu <- mean(x, na.rm = TRUE); sdv <- sd(x, na.rm = TRUE)
+        if (is.na(sdv) || sdv == 0) rep(FALSE, length(x)) 
+        else abs((x - mu)/sdv) > z
+        })
+    flagged <- if (is.matrix(Z)) apply(Z, 1, any) else Z
+    dat[[id_col]][which(flagged)]
+}
+```
+
+```{r threshold-functions, include=FALSE}
+# function that calculates F1 
+f1_binary <- function(obs, pred, positive = "YES"){
+    tp <- sum(obs == positive & pred == positive)
+    fp <- sum(obs != positive & pred == positive)
+    fn <- sum(obs == positive & pred != positive)
+    if ((tp + fp) == 0 || (tp + fn) == 0) return(0)
+    prec <- tp / (tp + fp)
+    rec  <- tp / (tp + fn)
+    if ((prec + rec) == 0) return(0)
+    2 * prec * rec / (prec + rec)
+}
+
+# a function that converts predicted probabilities into class predictions 
+# based on a chosen threshold
+pred_from_prob <- function(p, thr, pos = "YES", neg = "NO") {
+    factor(ifelse(p >= thr, pos, neg), levels = c(neg, pos))
+}
+
+# Helper function  to determine the F1 score used in best_threshold
+f1_at_threshold <- function(p, y, thr, pos = "YES" , neg = "NO") {
+    pred <- pred_from_prob(p, thr, pos, neg)
+    f1_binary(y, pred, positive = pos)
+}
+
+# function the finds the best threshold to maximize F1
+best_threshold <- function(p, y, pos = "YES", neg = "NO", 
+                           grid = seq(0.001, 0.999, by = 0.001)) {
+  f1s <- vapply(grid, function(t) f1_at_threshold(p, y, t), numeric(1))
+  i_best <- which.max(f1s)
+  data.frame(threshold = grid[i_best], F1 = f1s[i_best])
+}
+
+```
+
+```{r f1-summary, include=FALSE}
+# function so F1 is used internally in model evaluation
+f1_summary <- function(data, lev = NULL, model = NULL) {
+    # expecting lev = c("NO","YES")
+    pos <- lev[2]
+    tp <- sum(data$pred == pos & data$obs == pos)
+    fp <- sum(data$pred == pos & data$obs != pos)
+    fn <- sum(data$pred != pos & data$obs == pos)
+    precision <- if ((tp + fp) == 0) 0 else tp/(tp+fp)
+    recall    <- if ((tp + fn) == 0) 0 else tp/(tp+fn)
+    F1 <- if ((precision + recall) == 0) 0 else
+        2*precision*recall/(precision+recall)
+    c(F1 = F1)               
+}
+
+```
+
+```{r AUC-function, include=FALSE}
+# function to calculate AUC from probabilities
+auc_binary <- function(obs, prob, positive = "YES"){
+  roc_obj <- roc(response = obs, predictor = prob, levels = rev(levels(obs)),
+                 quiet = TRUE)
+  as.numeric(roc_obj$auc)
+}
+```
+
+```{r caret-summary, include=FALSE}
+# function that summarizes for caret when using classProbs=TRUE
+f1_auc_summary <- function(data, lev = NULL, model = NULL) {
+  # data has columns: observations, predictions, and one column per class prob
+  positive <- lev[2]         # assume lev = c("NO","YES")
+  prob_pos <- data[[positive]]
+  
+  # F1
+  f1 <- f1_binary(data$obs, data$pred, positive = positive)
+  
+  # ROC
+  roc_val <- auc_binary(data$obs, prob_pos, positive = positive)
+  c(F1 = f1, ROC = roc_val)
+}
+```
+
+```{r xgb-matrix, include=FALSE}
+# function that takes a data frame and make a matrix to pass to xgboost. 
+# It will ensure all matrices have the same columns 
+make_xgb_matrix <- function(train_df, new_df, feature_cols) {
+    # Subset to predictors only
+    train_raw <- train_df[, feature_cols, drop = FALSE]
+    new_raw   <- new_df[,   feature_cols, drop = FALSE]
+  
+    # One-hot encode using model.matrix (~ . - 1 removes intercept)
+    train_mat <- model.matrix(~ . - 1, data = train_raw)
+    new_mat   <- model.matrix(~ . - 1, data = new_raw)
+  
+    # Get column names from training
+    train_cols <- colnames(train_mat)
+  
+    # ALIGN NEW MAT TO TRAIN MAT
+  
+    # Add any missing columns in new_mat
+    missing_cols <- setdiff(train_cols, colnames(new_mat))
+    if (length(missing_cols) > 0) {
+        for (mc in missing_cols) {
+            new_mat <- cbind(new_mat, setNames(data.frame(0), mc))
+        }
+    }
+  
+    # Remove extra columns not present in training
+    extra_cols <- setdiff(colnames(new_mat), train_cols)
+    if (length(extra_cols) > 0) {
+        new_mat <- new_mat[, setdiff(colnames(new_mat), extra_cols), drop = FALSE]
+    }
+    # Reorder columns to match training exactly
+    new_mat <- new_mat[, train_cols, drop = FALSE]
+  
+    # Return clean matrices
+    list(
+    train_matrix = train_mat,
+    new_matrix   = new_mat,
+    feature_names = train_cols)
+}
+
+```
+
+```{r f1-meta-learner, include=FALSE}
+#  Function to optimize F1 for the glmnet meta-learner
+tune_meta_glmnet_F1 <- function(X, y_factor,
+                                alpha = 0,
+                                lambda_grid = 10^seq(-3, 1, length.out = 30),
+                                K = 5,
+                                thr_grid = seq(0.01, 0.8, by = 0.01),
+                                seed = 130) {
+    set.seed(seed)
+  
+    # Ensure y is factor with levels c("NO","YES")
+    y_factor <- factor(y_factor, levels = c("NO", "YES"))
+    n <- nrow(X)
+  
+    # Stratified folds
+    folds <- createFolds(y_factor, k = K, returnTrain = FALSE)
+ 
+    mean_F1      <- numeric(length(lambda_grid))
+    best_thr_by_lambda <- numeric(length(lambda_grid))
+  
+    for (l in seq_along(lambda_grid)) {
+        lam <- lambda_grid[l]
+
+        # Collect OOF probs for this lambda
+        probs_all <- numeric(n)
+    
+        for (k in seq_along(folds)) {
+            val_idx <- folds[[k]]
+            train_idx <- setdiff(seq_len(n), val_idx)
+      
+            X_tr <- X[train_idx, , drop = FALSE]
+            X_va <- X[val_idx, , drop = FALSE]
+            y_tr <- y_factor[train_idx]
+      
+            # Fit glmnet on this fold/train with a single lambda
+            fit_k <- glmnet(
+                x = X_tr,
+                y = ifelse(y_tr == "YES", 1, 0), # numeric 0/1 internally
+                family = "binomial",
+                alpha = alpha,
+                lambda = lam,
+                standardize = TRUE
+                )
+      
+            prob_va <- as.vector(
+                predict(fit_k, newx = X_va, s = lam, type = "response")
+                )
+            probs_all[val_idx] <- prob_va
+            }
+    
+        # Choose the BEST threshold for this lambda over ALL OOF probs
+        bt <- best_threshold(
+            p = probs_all,
+            y = y_factor,
+            pos = "YES",
+            neg = "NO",
+            grid = thr_grid
+            )
+    
+        mean_F1[l] <- bt$F1
+        best_thr_by_lambda[l] <- bt$threshold
+        }
+    
+    # Pick lambda with highest mean F1
+    best_idx <- which.max(mean_F1)
+    best_lambda <- lambda_grid[best_idx]
+    best_thr <- best_thr_by_lambda[best_idx]
+  
+    # Refit on full data with best lambda
+    final_fit <- glmnet(
+        x = X,
+        y = ifelse(y_factor == "YES", 1, 0),
+        family = "binomial",
+        alpha = alpha,
+        lambda = best_lambda,
+        standardize = TRUE
+        )
+    
+    # returns final model, lamda grid, mean F1, best lamda. 
+    # F1-optimal threshold for this lambda on OOF
+    list(
+        fit = final_fit,
+        lambda_grid = lambda_grid,
+        mean_F1 = mean_F1,
+        best_lambda = best_lambda,  
+        best_thr = best_thr 
+    )
+    
+    }
+```
+
+
+### Prepare data sets for training 
+Row_id will be dropped for all models before the dataframe is used in the model. GLM will use log transformed numeric columns and drop the plain numeric columns. Random forest and XGBoost will use drop the log transformed columns and keep the numeric columns. 
+
+```{r drop-cols, include=FALSE}
+# drop row_id from all models before modeling 
+drop_cols <- "row_id"
+# numeric columns
+numeric_raw <- c("age", "bmi", "avg_glucose_level")
+# log tranformed columns
+numeric_log <- paste0(numeric_raw, "_log")
+
+# GLM columns for modeling, dropping numeric columns and row_id
+keep_cols_glm <- setdiff(names(train), c(numeric_raw, drop_cols))
+
+# RF columns for modeling, dropping log columns and row_id
+keep_cols_rf <- setdiff(names(train), c(numeric_log, drop_cols))
+
+# Xgboost will use the same columns as random forest
+keep_cols_xgb <- keep_cols_rf
+
+
+# columns to keep with target variable removed
+keep_cols_glm_feats <- setdiff(keep_cols_glm, target)
+keep_cols_rf_feats <- setdiff(keep_cols_rf, target)
+keep_cols_xgb_feats <- setdiff(keep_cols_xgb, target)
+
+```
+
+```{r training-sets, include=FALSE} 
+# GLMNET uses pruned + outlier-removed set
+glm_train <- train[, keep_cols_glm, drop = FALSE]
+out_ids_train <- find_outlier_ids(cbind(glm_train[, sapply
+                                                  (glm_train, is.numeric), 
+                                                  drop = FALSE],
+                                        row_id = train$row_id))
+glm_train_clean <- glm_train[!(train$row_id %in% out_ids_train), , drop = FALSE]
+
+# Calculate weights for final GLM training
+glm_train_clean <- add_obs_weights(glm_train_clean)
+weights_glm <- glm_train_clean$obs_weight
+
+# RF training set
+rf_train  <- train[, keep_cols_rf, drop = FALSE]
+
+# XGBoost training set and validation set
+xgb_train <- train[, keep_cols_xgb, drop = FALSE]
+xgb_train_y <- xgb_train[[target]]
+xgb_data <- make_xgb_matrix(
+  train_df    = train,
+  new_df      = val,
+  feature_cols = keep_cols_xgb_feats
+)
+
+# XGBoost test set
+xgb_data_2 <- make_xgb_matrix(
+  train_df    = train,
+  new_df      = test,
+  feature_cols = keep_cols_xgb_feats
+)
+
+xgb_train <- xgb_data$train_matrix
+xgb_val   <- xgb_data$new_matrix
+xgb_test <- xgb_data_2$new_matrix
+```
+
+```{r control, include=FALSE}
+# Tell train() how to resample, how to tune, how to handle class imbalance, 
+# and what metrics to compute.
+ctrl_F1_auc <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = f1_auc_summary,
+  savePredictions = "final",
+  allowParallel = FALSE
+)
+```
+
+### Train glmnet
+I will train a bagged GLM model. This means its an ensemble of multiple elastic-net logistic regression models, each trained on a different bootstrap sample of the training data. I created two functions. `train_bag_glmnet()` is a function that creates bagged logistic regression model using glmnet with a alpha of 0.5. Elastic net regression should work best with an imbalanced outcome variable. It will tune for lambda with a default grid unless otherwise specified. `predict_bag_glmnet()` is a function to predict bagged glmnet. It takes a bagged model and data frame for predictions and can take a custom threshold.
+```{r train-bagging, include=FALSE}
+# function to create bagged logistic regression model using glmnet
+# alpha = 0.5. Elastic net regression should work best with imbalanced outcome 
+# variable, will tune for lamda with default grid unless otherwise specified 
+train_bag_glmnet <- function(df, 
+                             weights_vec,
+                             B = 10, 
+                             alpha = 0.5,
+                             lambda_grid = NULL,
+                             preProc = c("center", "scale")) {
+    stopifnot("stroke" %in% names(df))
+    
+    # Ensure stroke is factor(NO, YES)
+    df$stroke <- factor(df$stroke, levels = c("NO","YES"))
+    if (any(is.na(df$stroke))) {
+        stop("stroke must only contain 'NO' and 'YES'.")
+        }
+    
+    # Drop row_id AND obs_weight if present
+    df <- df[, setdiff(names(df), c("row_id", "obs_weight")), drop = FALSE]
+    
+    # Validate weights
+    if (missing(weights_vec)) stop("weights_vec is required.")
+    if (length(weights_vec) != nrow(df)) stop("weights_vec must match nrow(df).")
+    
+    # Numeric 0/1 response for glmnet (YES = 1)
+    y <- ifelse(df$stroke == "YES", 1, 0)
+    
+     # Build design matrix from predictors only 
+    # : dummy-encode factors, remove intercept
+    pred_cols <- setdiff(names(df), "stroke")
+    X <- model.matrix(~ . , data = df[, pred_cols, drop = FALSE])[, -1, 
+                                                                  drop = FALSE]
+    
+    # Default lambda grid if not provided
+    if (is.null(lambda_grid)) {
+        lambda_grid <- 10^seq(-3, 1, length.out = 20)
+    }
+    
+    # Train all bags
+    models <- vector("list", B)
+    best_lambdas <- numeric(B)
+    
+    for (b in seq_len(B)) {
+        set.seed(1000 + b)
+        n <- nrow(X)
+        idx_boot <- sample.int(n, size = n, replace = TRUE)
+        
+        X_boot <- X[idx_boot, , drop = FALSE]
+        y_boot <- y[idx_boot]
+        weights_boot <- weights_vec[idx_boot]
+        
+        
+        # Fit glmnet on full bootstrap sample
+        full_fit <- glmnet(
+            x = X_boot,
+            y = y_boot,
+            family = "binomial",
+            alpha = alpha,
+            lambda = lambda_grid,
+            weights = weights_boot,
+            standardize = TRUE # glmnet handles scaling
+        )
+        
+        # Manual 5-fold CV to find best lambda using F1
+        n_boot <- nrow(X_boot)
+        cv_folds <- sample(rep(1:5, length.out = n_boot))
+        f1_scores <- matrix(NA, nrow = 5, ncol = length(lambda_grid))
+        
+        for (fold in 1:5) {
+            train_idx <- cv_folds != fold
+            val_idx <- cv_folds == fold
+            
+            fold_fit <- glmnet(
+                x = X_boot[train_idx, , drop = FALSE],
+                y = y_boot[train_idx],
+                family = "binomial",
+                alpha = alpha,
+                lambda = lambda_grid,
+                weights = weights_boot[train_idx],
+                standardize = TRUE
+            )
+            
+            # Predict on validation fold for each lambda
+            for (l in seq_along(lambda_grid)) {
+                pred_prob <- predict(fold_fit, 
+                                    newx = X_boot[val_idx, , drop = FALSE],
+                                    s = lambda_grid[l],
+                                    type = "response")
+                pred_class <- ifelse(pred_prob >= 0.5, 1, 0)
+                
+                # Calculate F1
+                y_val <- y_boot[val_idx]
+                tp <- sum(y_val == 1 & pred_class == 1)
+                fp <- sum(y_val == 0 & pred_class == 1)
+                fn <- sum(y_val == 1 & pred_class == 0)
+                
+                if ((tp + fp) == 0 || (tp + fn) == 0) {
+                    f1_scores[fold, l] <- 0
+                } else {
+                    prec <- tp / (tp + fp)
+                    rec <- tp / (tp + fn)
+                    f1_scores[fold, l] <- if ((prec + rec) == 0) 0 else 2 * 
+                        prec * rec / (prec + rec)
+                }
+            }
+        }
+        
+        # Average F1 across folds for each lambda
+        mean_f1 <- colMeans(f1_scores, na.rm = TRUE)
+        best_lambda_idx <- which.max(mean_f1)
+        best_lambda <- lambda_grid[best_lambda_idx]
+        
+        # Store the full model fitted on all bootstrap data
+        models[[b]] <- full_fit
+        best_lambdas[b] <- best_lambda
+        
+    }
+    
+    structure(
+        list(
+            models = models, 
+            best_lambdas = best_lambdas,
+            predictor_names = colnames(X),
+            alpha = alpha,
+            lambda_grid = lambda_grid
+        ), 
+        class = "bag_glmnet"
+    )
+}
+```
+
+```{r predict-bagging, include=FALSE}
+# Function to predict bagged glmnet, takes bagged model and data frame 
+# for predictions and can take custom threshold
+predict_bag_glmnet <- function(bag, newdata, type = c("prob","class"), 
+                               threshold = 0.5) {
+    type <- match.arg(type)
+    stopifnot(inherits(bag, "bag_glmnet"))
+    
+    # Drop row_id if present
+    if ("row_id" %in% names(newdata)) {
+        newdata <- newdata[, setdiff(names(newdata), "row_id"), drop = FALSE]
+    }
+    
+    # Build model.matrix using same formula as training
+    X_new <- model.matrix( ~ gender + hypertension +
+                               heart_disease +
+                               ever_married + work_type + 
+                               Residence_type + smoking_status +
+                               age_log + avg_glucose_level_log
+                           + bmi_log, data = newdata
+                           )[ , -1, drop = FALSE] # drop intercept
+    
+    # align columns: add missing, drop extra, reorder
+    needed <- bag$predictor_names
+    
+    # add any missing dummy columns as zeros
+    missing_cols <- setdiff(needed, colnames(X_new))
+    if (length(missing_cols) > 0){
+        X_new_missing <- matrix(0, nrow = nrow(X_new), 
+                                ncol = length(missing_cols))
+        colnames(X_new_missing) <- missing_cols
+        X_new <- cbind(X_new, X_new_missing)
+    }
+    
+    # drop any extra columns not used in training
+    extra_cols <- setdiff(colnames(X_new), needed)
+    if(length(extra_cols) > 0){
+        X_new <- X_new[, setdiff(colnames(X_new), extra_cols), drop = FALSE]
+    }
+    
+    # Final ordering
+    X_new <- X_new[, needed, drop = FALSE]
+
+    # Collect probabilities from each bag
+    probs_list <- lapply(seq_along(bag$models), function(i) {
+        fit <- bag$models[[i]]
+        lambda_best <- bag$best_lambdas[i]
+        
+        # Predict using glmnet
+        pred_prob <- predict(
+            fit, 
+            newx = X_new, 
+            s = lambda_best, 
+            type = "response"
+        )
+        
+        as.vector(pred_prob)
+    })
+    
+    p_mean <- Reduce(`+`, probs_list) / length(probs_list)
+    
+    if (type == "prob") return(p_mean)
+    
+    # Return class labels as factor("NO","YES")
+    factor(ifelse(p_mean >= threshold, "YES", "NO"), levels = c("NO","YES"))
+}
+```
+
+```{r bagged-glm, echo=TRUE}
+bag_glm_final <- train_bag_glmnet(
+  df = glm_train_clean,
+  weights_vec = weights_glm,
+  B = 10,
+  alpha = 0.5
+)
+```
+
+### Train Random Forest
+I will use balanced random forest because the data is imbalanced. It uses undersampling on the majority class to balance the dataset for each tree. I created a function `pretune_rf_F1()`. It pretunes random forest for F1 using k-fold cross validation. It uses a balanced random forest. 
+```{r pre-tune-rf, include=FALSE}
+# function to pretune RF for F1 using k-fold CV. Using balanced random forest. 
+# takes dataframe, feature columns, will default create mtry_grid if 
+# not provided. Will default to find threshold as well. 
+pretune_rf_F1 <- function(dat, feature_cols, target = "stroke",
+                          k = 5,
+                          mtry_grid = NULL,
+                          ntree_grid = c(500, 1000, 2000),
+                          threshold_grid = seq(0.05, 0.5, by = 0.05), 
+                          # capping the threshold as 0.5 improves performance
+                          seed = 130){
+    set.seed(seed)
+    # ensure correct factors for target variable
+    dat[[target]] <- factor(dat[[target]], levels = c("NO","YES"))
+    p <- length(feature_cols)
+    # default mtry_grid
+    if (is.null(mtry_grid)) {
+        mtry_grid <- unique(pmax(2, c(floor(sqrt(p)), floor(p/3), 
+                                      floor(p/2), 8)))
+    }  
+    # create folds, default = 5
+    folds_in <- createFolds(dat[[target]], k = k, returnTrain = TRUE)
+    
+    param_grid <- expand.grid(mtry = mtry_grid, ntree = ntree_grid)
+    # create results data frame
+    results <- data.frame(param_grid, 
+                          mean_F1 = NA_real_, 
+                          best_threshold = NA_real_)
+    
+    for (g in seq_len(nrow(param_grid))) {
+        mtry_val <- param_grid$mtry[g]
+        ntree_val <- param_grid$ntree[g]
+        
+        # rows: thresholds, columns: folds
+        f1_mat <- matrix(NA_real_, 
+                         nrow = length(threshold_grid), 
+                         ncol = k,
+                         dimnames = list(
+                             paste0("thr_", threshold_grid),
+                             paste0("fold_", seq_len(k))
+                             ))
+        
+        for (i in seq_len(k)) {
+            tr_idx <- folds_in[[i]]
+            va_idx <- setdiff(seq_len(nrow(dat)), tr_idx)
+            tr <- dat[tr_idx, c(feature_cols, target), drop = FALSE]
+            va <- dat[va_idx, c(feature_cols, target), drop = FALSE]
+            # Balanced sampling: same number of NO and YES in each tree
+            # names MUST match levels(y_train) = c("NO","YES")
+            tbl_all <- table(tr[[target]])
+            n_min   <- min(tbl_all)   # per-class sample size for each tree
+            sampsize_vec <- c("NO" = n_min, "YES" = n_min)
+            set.seed(seed + i + g)
+            fit <- randomForest(
+                x = tr[, feature_cols, drop = FALSE],
+                y = tr[[target]],
+                ntree = ntree_val,
+                mtry = mtry_val,
+                sampsize = sampsize_vec,    
+                )
+            pr <- predict(fit, newdata = va[, feature_cols, drop = FALSE], 
+                          type = "prob")[, "YES"]
+             # loop over thresholds
+            for (t in seq_along(threshold_grid)) {
+                thr <- threshold_grid[t]
+                pred_lab <- factor(ifelse(pr >= thr, "YES", "NO"),
+                                   levels = c("NO","YES"))
+                f1_mat[t, i] <- f1_binary(va[[target]], pred_lab, 
+                                          positive = "YES")
+            }
+        }
+        # average F1 over folds for each threshold
+        mean_F1_by_thr <- rowMeans(f1_mat, na.rm = TRUE)
+        # choose best threshold for this (mtry, ntree)
+        best_t_idx <- which.max(mean_F1_by_thr)
+        results$mean_F1[g] <- mean_F1_by_thr[best_t_idx]
+        results$best_threshold[g] <- threshold_grid[best_t_idx]
+        }
+    
+    best <- results[order
+                    (-results$mean_F1, -results$mtry, 
+                        -results$ntree), ][1, ] # decreasing = TRUE
+    # return list with best, mtry, ntree and threshold and data frame of the
+    # cross validation table with each mtry and ntree 
+    list(mtry = best$mtry, 
+         ntree = best$ntree,
+         threshold = best$best_threshold,
+         cv_table = results)
+}
+```
+
+```{r train-rf, include=FALSE}
+rf_best <- pretune_rf_F1(
+  dat = rf_train,
+  feature_cols = keep_cols_rf_feats,
+  target = target,
+  k = 5,
+  mtry_grid = NULL,
+  ntree_grid = c(500, 1000, 1500),
+  seed = 130
+)
+rf_best
+
+tbl_train <- table(rf_train[[target]])
+n_min_train <- min(tbl_train)
+sampsize_vec <- c("NO" = n_min_train, "YES" = n_min_train)
+
+```
+
+```{r trained-rf, echo=TRUE}
+rf_mod_final <- randomForest(
+  x = rf_train[, keep_cols_rf_feats, drop = FALSE],
+  y = rf_train[[target]],
+  ntree = rf_best$ntree,
+  mtry  = rf_best$mtry,
+  sampsize = sampsize_vec
+)
+```
+
+For random forest the best mtry - the hyperparameter that tells random forest how many random variables to use for each split - is `r rf_best$mtry`. The best ntree - the number of tree grown for random forest - is `r rf_best$ntree`. 
+
+### Train XGBoost
+Extreme Gradient Boosting (XGBoost) is a high-performance implementation of gradient-boosted decision trees. It builds a sequence of decision trees. Each new tree tries to correct the residual errors of the previous trees.
+```{r train-xgboost, echo=TRUE, warning=FALSE, message = FALSE}
+xgb_grid <- expand.grid(
+  nrounds = c(100, 200), # number of boosting iterations
+  max_depth = c(3, 5), # depth of each tree
+  eta = c(0.05, 0.1), # learning rate (shrinkage)
+  gamma = 0, # minimum loss reduction for splitting
+  colsample_bytree = 0.8, # feature subsampling
+  min_child_weight = 1, # minimum lead node Hessian
+  subsample = 0.8 # row subsampling
+)
+
+set.seed(130)
+# This uses caret to build the xgboost model. Caret uses ntree_limit internally.
+# However it was deprecated so it produces a warning. I wrapped it to silence
+# the warnings 
+invisible(capture.output({
+    xgb_fit <- train(
+        x = xgb_train,
+        y = xgb_train_y,
+        method = "xgbTree",
+        trControl = ctrl_F1_auc,
+        tuneGrid = xgb_grid,
+        metric = "F1",                   # TUNE on F1
+        weights = cw_vec[as.character(xgb_train_y)]
+        )
+    }))
+
+xgb_fit$bestTune
+```
+
+### Ensemble tuning
+Tune the models on the validation set to find the best threshold for each model. 
+```{r validation-sets, include=FALSE}
+# GLMNET validation set
+glm_val <- val[ ,keep_cols_glm_feats, drop = FALSE]
+
+# RF validation set
+rf_val  <- val[, keep_cols_rf_feats, drop = FALSE]
+```
+
+
+```{r validation-prediction, echo=TRUE}
+# GLM validation prediction
+val_prob_glm <- predict_bag_glmnet(bag_glm_final, glm_val, type = "prob")
+
+# RF prediction
+val_prob_rf  <- predict(rf_mod_final, rf_val, type = "prob")[, "YES"]
+
+# XGB prediction
+val_prob_xgb <- predict(xgb_fit, xgb_val, type = "prob")[, "YES"]
+
+```
+
+
+```{r best-threshold, include=FALSE}
+# Best thresholds per model
+glm_best_thr <- best_threshold(val_prob_glm, val[[target]], pos = "YES", neg = "NO")
+rf_best_thr  <- best_threshold(val_prob_rf,  val[[target]], pos = "YES", neg = "NO")
+xgb_best_thr <- best_threshold(val_prob_xgb, val[[target]], pos = "YES", neg = "NO")
+```
+
+The best threshold for glmnet is (`r glm_best_thr$threshold`) with a F1 of (`r glm_best_thr$F1`). This means glmnet is reasonably calibrated. The best threshold for random forest is (`r rf_best_thr$threshold`) with a  F1 of (`r round(rf_best_thr$F1, 2)`). This makes sense since a balanced random forest inflates the positive variable "YES". The best threshold for XGBoost is (`r xgb_best_thr$threshold`) with a F1 of (`r round(xgb_best_thr$F1, 2)`). This makes sense since XGBoost is often over confident and often predicts yes leading to many false positives, so it needs the highest threshold.
+
+```{r auc-validation, include=FALSE}
+# AUC on validation
+val_auc_glm <- auc_binary(val[[target]], val_prob_glm, positive = "YES")
+val_auc_rf  <- auc_binary(val[[target]], val_prob_rf,  positive = "YES")
+val_auc_xgb <- auc_binary(val[[target]], val_prob_xgb, positive = "YES")
+```
+
+The AUC of glmnet on the validation set is (`r round(val_auc_glm, 3)`). The AUC of random forest on the validation set is (`r round(val_auc_rf, 3)`). The AUC of XGBoost on the validation set is (`r round(val_auc_xgb, 3)`).  
+
+### Heterogenous Ensemble
+
+I will build a heterogeneous ensemble using out of fold stacking using the combined train and validation sets. Initially, I weighted the models based on their performance on the validation set. However, this resulted in weighting some models higher and then having them perform worse on the test set. Using out of fold probabilities will improve the ensemble weights because the validation signal is averaged across folds. I will stack the models using logistic regression - ridge penalty. This will encourage a blend of all models, so one model isn't completely favored. This will be done in a for loop using 5-fold stratified cross validation. 
+```{r ensemble-function, include=FALSE}
+# Function to create a heterogeneous ensemble using glm, random forest, 
+# and xgboost. It uses out of fold probabilities and then stacks with a 
+# logistic regression model using ridge penalty. Combines training and 
+# validation set. Requires desired columns for each model. Will find best lambda
+# and threshold
+build_stacked_ensemble <- function(
+        train,
+        val,
+        keep_cols_glm,
+        keep_cols_glm_feats,
+        keep_cols_rf_feats,
+        keep_cols_xgb_feats,
+        rf_best,
+        sampsize_vec,
+        best_xgb,
+        cw_vec,
+        K = 5,
+        B_glm = 10,
+        alpha_meta = 0,
+        lambda_grid = 10^seq(-3, 1, length.out = 30),
+        seed = 130) {
+    set.seed(seed)
+    
+    # Combine train + val for OOF stacking
+    train_full <- rbind(train, val)
+    stopifnot("stroke" %in% names(train_full))
+    train_full$stroke <- factor(train_full$stroke, levels = c("NO", "YES"))
+    n <- nrow(train_full)
+    
+    # Allocate OOF vectors
+    oof_glm <- numeric(n)
+    oof_rf  <- numeric(n)
+    oof_xgb <- numeric(n)
+    
+    # XGBoost trainControl
+    ctrl_xgb_final <- trainControl(
+        method = "none",
+        classProbs = TRUE,
+        summaryFunction = f1_auc_summary
+    )
+    
+    # Folds
+    folds <- createFolds(train_full$stroke, k = K, returnTrain = FALSE)
+    
+    # Loop over folds
+    for (k in seq_along(folds)) {
+        valid_idx <- folds[[k]]
+        train_idx <- setdiff(seq_len(n), valid_idx)
+        
+        dat_tr <- train_full[train_idx, , drop = FALSE]
+        dat_va <- train_full[valid_idx, , drop = FALSE]
+        
+        # GLMNET (bagged) 
+        glm_train_full <- dat_tr[, keep_cols_glm, drop = FALSE]
+        
+        out_ids_train_full <- find_outlier_ids(
+            cbind(
+                glm_train_full[, sapply(glm_train_full, is.numeric), drop = FALSE],
+                row_id = dat_tr$row_id
+            )
+        )
+        
+        glm_train_full_clean <- glm_train_full[!(dat_tr$row_id %in% out_ids_train_full),
+                                               , drop = FALSE]
+        
+        glm_train_full_clean <- add_obs_weights(glm_train_full_clean)
+        weights_glm_full <- glm_train_full_clean$obs_weight
+        
+        bag_glm <- train_bag_glmnet(
+            df = glm_train_full_clean,
+            weights_vec = weights_glm_full,
+            B = B_glm,
+            alpha = 0.5
+        )
+        
+        prob_glm_va <- predict_bag_glmnet(
+            bag_glm,
+            newdata = dat_va[, keep_cols_glm_feats, drop = FALSE],
+            type = "prob"
+        )
+        oof_glm[valid_idx] <- prob_glm_va
+        
+        # Random Forest
+        rf_tr <- dat_tr[, c(keep_cols_rf_feats, "stroke"), drop = FALSE]
+        rf_va <- dat_va[, keep_cols_rf_feats, drop = FALSE]
+        
+        rf_fit <- randomForest(
+            stroke ~ .,
+            data = rf_tr,
+            ntree = rf_best$ntree,
+            mtry = rf_best$mtry,
+            sampsize = sampsize_vec
+        )
+        
+        prob_rf_va <- predict(rf_fit, newdata = rf_va, type = "prob")[, "YES"]
+        oof_rf[valid_idx] <- prob_rf_va
+        
+        # XGBoost  
+        xgb_data_full <- make_xgb_matrix(
+            train_df = dat_tr,
+            new_df = dat_va,
+            feature_cols = keep_cols_xgb_feats
+        )
+        xgb_tr   <- xgb_data_full$train_matrix
+        xgb_val2 <- xgb_data_full$new_matrix
+        
+        y_tr <- dat_tr$stroke  # factor(NO, YES)
+        
+        xgb_fit_fold <- train(
+            x = xgb_tr,
+            y = y_tr,
+            method = "xgbTree",
+            trControl = ctrl_xgb_final,
+            tuneGrid = best_xgb,
+            metric = "F1",
+            weights = cw_vec[as.character(y_tr)]
+        )
+        
+        prob_xgb_va <- predict(
+            xgb_fit_fold,
+            newdata = xgb_val2,
+            type = "prob"
+        )[ , "YES"]
+        
+        oof_xgb[valid_idx] <- prob_xgb_va
+    }
+    
+    # Build stacking training set
+    stack_train <- data.frame(
+        glm = oof_glm,
+        rf = oof_rf,
+        xgb = oof_xgb,
+        stroke = train_full$stroke
+    )
+    
+    # Meta-learner (ridge GLMNET on OOF probs)
+    X_meta <- as.matrix(stack_train[, c("glm", "rf", "xgb")])
+    y_meta_factor <- stack_train$stroke
+    
+    meta_cv <- tune_meta_glmnet_F1(
+        X = X_meta,
+        y_factor = y_meta_factor,
+        alpha = alpha_meta,
+        lambda_grid = lambda_grid,
+        K = K,
+        seed = seed
+    )
+    
+    meta_fit <- meta_cv$fit
+    meta_best_lambda <- meta_cv$best_lambda
+    meta_oof_thr <- meta_cv$best_thr
+    meta_f1 <- max(meta_cv$mean_F1)
+    
+    # Return everything need for later
+    list(
+        train_full  = train_full,
+        stack_train = stack_train,
+        oof_preds = data.frame(glm = oof_glm, rf = oof_rf, xgb = oof_xgb),
+        folds = folds,
+        meta_fit = meta_fit,
+        meta_best_lambda = meta_best_lambda,
+        meta_oof_thr = meta_oof_thr,
+        meta_f1 = meta_f1,
+        meta_cv = meta_cv
+    )
+}
+
+```
+
+```{r meta-learner, echo=FALSE}
+ensemble_obj <- build_stacked_ensemble(
+    train = train,
+    val = val,
+    keep_cols_glm = keep_cols_glm,
+    keep_cols_glm_feats = keep_cols_glm_feats,
+    keep_cols_rf_feats = keep_cols_rf_feats,
+    keep_cols_xgb_feats = keep_cols_xgb_feats,
+    rf_best = rf_best,
+    sampsize_vec = sampsize_vec,
+    best_xgb = xgb_fit$bestTune,
+    cw_vec = cw_vec
+)
+
+
+meta_fit <- ensemble_obj$meta_fit
+meta_best_lambda <- ensemble_obj$meta_best_lambda
+meta_oof_thr <- ensemble_obj$meta_oof_thr
+stack_train <- ensemble_obj$stack_train
+meta_f1 <- ensemble_obj$meta_f1
+coef(meta_fit, s = meta_best_lambda)
+```
+
+GLM is the largest positive coefficient so the meta-learner is trusting it the most, then XGBoost and finally random forest. 
+
+The best threshold for the stacked heterogeneous ensemble is (`r meta_oof_thr`). The F1 of the heterogeneous ensemble is (`r round(meta_f1, 3)`).
+
+## Predict and evaluate final models
+### Predictions on Base Models
+```{r prepare-testing-base-models, include=FALSE}
+# Prepare test matrices
+test_glm_data <- test[, keep_cols_glm_feats, drop = FALSE]
+test_rf_data  <- test[, keep_cols_rf_feats, drop = FALSE]
+```
+
+```{r preditcions-base-models, echo=TRUE}
+# Base-model probabilities
+test_prob_glm <- predict_bag_glmnet(bag_glm_final, test_glm_data, type = "prob")
+test_prob_rf  <- predict(rf_mod_final, test_rf_data, type = "prob")[, "YES"]
+test_prob_xgb <- predict(xgb_fit, xgb_test, type = "prob")[, "YES"]
+# Get predictions for base models using individual thresholds from validation
+test_pred_glm <- pred_from_prob(test_prob_glm, glm_best_thr$threshold, 
+                                pos = "YES", neg = "NO")
+test_pred_rf  <- pred_from_prob(test_prob_rf,  rf_best_thr$threshold,  
+                                pos = "YES", neg = "NO")
+test_pred_xgb <- pred_from_prob(test_prob_xgb, xgb_best_thr$threshold, 
+                                pos = "YES", neg = "NO")
+```
+
+```{r f1-auc-base-models, include=FALSE}
+# get F1 for base models
+test_f1_glm <- f1_binary(test[[target]], test_pred_glm, positive = "YES")
+test_f1_rf  <- f1_binary(test[[target]], test_pred_rf,  positive = "YES")
+test_f1_xgb <- f1_binary(test[[target]], test_pred_xgb, positive = "YES")
+
+# get AUC for base models
+test_auc_glm <- auc_binary(test[[target]], test_prob_glm, positive = "YES")
+test_auc_rf  <- auc_binary(test[[target]], test_prob_rf,  positive = "YES")
+test_auc_xgb <- auc_binary(test[[target]], test_prob_xgb, positive = "YES")
+```
+
+The F1 of glmnet is (`r round(test_f1_glm, 3)`) and the AUC is (`r round(test_auc_glm, 3)`). The F1 of random forest is (`r round(test_f1_rf, 3)`) and the AUC is (`r round(test_auc_rf, 3)`).  The F1 of XGBoost is (`r round(test_f1_xgb, 3)`) and the AUC is (`r round(test_auc_xgb, 3)`). Interestingly GLM performed best on the validation data and within the stacked model on the training and validation sets. However, it performs worst on the testing data. This likely means GLM was slightly over fit. XGBoost performed the best on the testing set. 
+
+### Predictions for Heterogenous Ensemble 
+```{r bind-testing-ensemble, include=FALSE}
+# Heterogeneous ensemble with a meta-learner
+X_test_meta <- cbind(
+    glm = test_prob_glm,
+    rf  = test_prob_rf,
+    xgb = test_prob_xgb
+    )
+```
+
+```{r predict-ensemble, echo=TRUE}
+# get probabilities from stacked ensemble
+test_prob_ensemble <- as.numeric(predict(meta_fit, 
+                                         newx = X_test_meta, 
+                                         s = meta_best_lambda, 
+                                         type = "response")
+                                 )
+# get predictions from stacked ensemble
+test_pred_ensemble <- pred_from_prob(
+    test_prob_ensemble,
+    thr = meta_oof_thr,
+    pos = "YES",
+    neg = "NO"
+    )
+```
+
+```{r f1-auc-ensemble, include=FALSE}
+# calculate F1 and AUC on stacked ensemble 
+test_f1_ensemble  <- f1_binary(test[[target]], test_pred_ensemble,  
+                               positive = "YES")
+test_auc_ensemble <- auc_binary(test[[target]], test_prob_ensemble, 
+                                positive = "YES")
+```
+
+After optimizing the stacking meta-learner directly for F1, the stacked model achieved an AUC of (`r round(test_auc_ensemble, 3)`) and an F1 score of (`r round(test_f1_ensemble, 3)`) on the test set. XGBoost alone obtained the same AUC (`r round(test_auc_xgb, 3)`) but a slightly higher F1 score (`r round(test_f1_xgb, 3)`). The predicted probabilities from the stacked model and XGBoost are extremely similar, with a Spearman correlation of `r round(cor(test_prob_ensemble, test_prob_xgb, method = "spearman"), 4)`, indicating that the ensemble has not substantially changed the overall ranking of observations.
+
+This helps explain why the AUC values are effectively identical. AUC is a global, threshold-independent metric that depends only on the pairwise ranking of positive vs. negative cases across all possible thresholds. Unless the stacking layer meaningfully reorders many YES/NO pairs, AUC will not improve. In this setting, XGBoost has the strongest discrimination and highest variance among the base learners, so it dominates the global ordering. The meta-learner (a GLM) primarily shifts and rescales the probabilities in a way that can help around a particular decision threshold, but it does not dramatically change the rank ordering. The random forest contributes modestly but not enough to alter many pairwise rankings.
+
+Given that the stacked model does not improve AUC and its F1 score is slightly lower than that of XGBoost alone, I would favor using XGBoost by itself for this dataset. XGBoost is simpler than the heterogeneous stack (single model vs. three base learners plus a meta-learner), while delivering essentially the same or better performance. This also makes interpretation easier, since I can focus on one model’s feature importance rather than disentangling contributions across an ensemble.
+
+If I wanted to further explore ensembling, a possible next step would be to use a more flexible meta-learner such as XGBoost (or another tree-based model) in place of the GLM. That might capture nonlinear interactions between base-model predictions and yield better threshold-specific performance, but it would need careful cross-validation to avoid overfitting.
+
+### Citations
+1. fedesoriano. (2020). "Stroke Prediction Dataset." (Version 1) [Data set]. Kaggle. https://www.kaggle.com/datasets/fedesoriano/stroke-prediction-dataset/data
+
+2. Kuriakose, D., & Xiao, Z. (2020). Pathophysiology and Treatment of Stroke: Present Status and Future Perspectives. International Journal of Molecular Sciences, 21(20), 7609. https://doi.org/10.3390/ijms21207609
+
+3. Suszko, M., Sobocki, J., & Imieliński, C. (2022). Mortality in extremely low BMI anorexia nervosa patients: Implications of gastrointestinal and endocrine system dysfunction. Psychiatria Polska, 56(1), 89–100. https://doi.org/10.12740/PP/126233
+
+4. Terkawi, A. S., Rafiq, M., Algadaan, R., Ur Rehman, I., Doais, K. S., Durieux, M. E., & AlSohaibani, M. (2014). General anesthesia for the heaviest man in the world. Saudi Journal of Anaesthesia, 8(Suppl 1), S101–S104. https://doi.org/10.4103/1658-354X.144087
+
